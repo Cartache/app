@@ -9,13 +9,33 @@ DEFAULT_ARCH="amd64"
 ## $IMAGE_NAME var is injected into the build so the tag is correct.
 echo "[***] Build hook starting..."
 
+#SOURCE_BRANCH: the name of the branch or the tag that is currently being tested.
+echo "[---] SOURCE_BRANCH: $SOURCE_BRANCH"
+
+#DOCKERFILE_PATH: the dockerfile currently being built.
+echo "[---] DOCKERFILE_PATH: ${DOCKERFILE_PATH}"
+
+#DOCKER_REPO: the name of the Docker repository being built.
+echo "[---] DOCKER_REPO: ${DOCKER_REPO}"
+
+#DOCKER_TAG: the Docker repository tag being built.
+echo "[---] DOCKER_TAG: ${DOCKER_TAG}"
+
+#IMAGE_NAME: the name and tag of the Docker repository being built. (This variable is a combination of DOCKER_REPO:DOCKER_TAG.)
+echo "[---] IMAGE_NAME: ${IMAGE_NAME}"
+
 # $(echo "index.docker.io/user/respository" | cut -d '/' -f 3) = "repository"
 APPLICATION=$(echo "${DOCKER_REPO}" | cut -d '/' -f 3)
-
-echo "[---] DOCKERFILE_PATH: ${DOCKERFILE_PATH}"
-echo "[---] DOCKER_REPO: ${DOCKER_REPO}"
-echo "[---] IMAGE_NAME: ${IMAGE_NAME}"
 echo "[---] APPLICATION: ${APPLICATION}"
+
+
+    
+
+    
+    
+    
+    
+
 
 # $(echo "index.docker.io/user/repository" | cut -d '/' -f 2-3) = "user/repository"
 # otherwise, you will need to set ENVIRONMENT VARIABLES for your build.
