@@ -28,15 +28,6 @@ echo "[---] IMAGE_NAME: ${IMAGE_NAME}"
 APPLICATION=$(echo "${DOCKER_REPO}" | cut -d '/' -f 3)
 echo "[---] APPLICATION: ${APPLICATION}"
 
-
-    
-
-    
-    
-    
-    
-
-
 # $(echo "index.docker.io/user/repository" | cut -d '/' -f 2-3) = "user/repository"
 # otherwise, you will need to set ENVIRONMENT VARIABLES for your build.
 if [ -z $GITHUB_USERREPO ]; then
@@ -97,8 +88,7 @@ do
     # Not exactly sure this needs to run EVERY time, but for good measure.
     docker run --rm --privileged multiarch/qemu-user-static:register --reset
 
-echo "[---] $(date +"%Y%m%d_%H%M%S"): Building $TARGET_ARCH image"
-
+  echo "[---] $(date +"%Y%m%d %H:%M:%S"): Building $TARGET_ARCH image"
   #     --file "${DOCKERFILE_PATH}.${TARGET_ARCH}" \
     docker build \
         --file Dockerfile.multiarch \
@@ -114,6 +104,7 @@ echo "[---] $(date +"%Y%m%d_%H%M%S"): Building $TARGET_ARCH image"
         .
 done
 
+echo "[---] $(date +"%Y%m%d %H:%M:%S"): Building default image"
 ## Build the prime image at the end.
 docker build \
     --file "${DOCKERFILE_PATH}" \
