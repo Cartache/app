@@ -97,6 +97,8 @@ do
     # Not exactly sure this needs to run EVERY time, but for good measure.
     docker run --rm --privileged multiarch/qemu-user-static:register --reset
 
+echo "[---] $(date +"%Y%m%d_%H%M%S"): Building $TARGET_ARCH image"
+
   #     --file "${DOCKERFILE_PATH}.${TARGET_ARCH}" \
     docker build \
         --file Dockerfile.multiarch \
