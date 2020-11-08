@@ -292,6 +292,8 @@ ALERT_REVERSE_ALIAS_UNKNOWN_MAILBOX = "reverse_alias_unknown_mailbox"
 # When a forwarding email is bounced
 ALERT_BOUNCE_EMAIL = "bounce"
 
+ALERT_BOUNCE_EMAIL_REPLY_PHASE = "bounce-when-reply"
+
 # When a forwarding email is detected as spam
 ALERT_SPAM_EMAIL = "spam"
 
@@ -326,3 +328,9 @@ MAX_SPAM_SCORE = 5.5
 SPAMASSASSIN_HOST = os.environ.get("SPAMASSASSIN_HOST")
 # use a more restrictive score when replying
 MAX_REPLY_PHASE_SPAM_SCORE = 5
+
+PGP_SENDER_PRIVATE_KEY = None
+PGP_SENDER_PRIVATE_KEY_PATH = os.environ.get("PGP_SENDER_PRIVATE_KEY_PATH")
+if PGP_SENDER_PRIVATE_KEY_PATH:
+    with open(get_abs_path(PGP_SENDER_PRIVATE_KEY_PATH)) as f:
+        PGP_SENDER_PRIVATE_KEY = f.read()

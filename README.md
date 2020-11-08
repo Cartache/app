@@ -744,7 +744,7 @@ Some errors should be fixed during development however: for example error like `
 
 All following endpoint return `401` status code if the API Key is incorrect.
 
-### Authentication endpoints
+### Account endpoints
 
 #### POST /api/auth/login
 
@@ -845,11 +845,23 @@ Output: if api key is correct, return a json with user name and whether user is 
   "name": "John Wick",
   "is_premium": false,
   "email": "john@wick.com",
-  "in_trial": true
+  "in_trial": true,
+  "profile_picture_url": "https://profile.png"
 }
 ```
 
 If api key is incorrect, return 401.
+
+#### PATCH /api/user_info
+
+Update user info
+
+Input:
+- profile_picture: the profile picture in base64. Setting to `null` remove the current profile picture.
+- name
+
+Output: same as GET /api/user_info
+
 
 #### POST /api/api_key
 
@@ -979,7 +991,7 @@ If success, 200 with the list of aliases. Each alias has the following fields:
 - mailboxes: list of mailbox, contains at least 1 mailbox.
     - id
     - email
-- (optional) latest_activity:
+- (nullable) latest_activity:
     - action: forward|reply|block|bounced
     - timestamp
     - contact:
@@ -1230,9 +1242,9 @@ Return 409 if contact is already added.
 
 ### Mailbox endpoints
 
-#### GET /api/mailboxes
+#### GET /api/v2/mailboxes
 
-Get user verified mailboxes.
+Get user's mailboxes, including unverified ones.
 
 Input:
 - `Authentication` header that contains the api key
@@ -1248,14 +1260,16 @@ List of mailboxes. Each mailbox has id, email, default, creation_timestamp field
       "id": 1,
       "default": true,
       "creation_timestamp": 1590918512,
-      "nb_alias": 10
+      "nb_alias": 10,
+      "verified": true
     },
     {
       "email": "m1@example.com",
       "id": 2,
       "default": false,
       "creation_timestamp": 1590918512,
-      "nb_alias": 0
+      "nb_alias": 0,
+      "verified": false
     }
   ]
 }
@@ -1369,6 +1383,56 @@ Input:
 Output: 
 200 if success
 
+### Settings endpoints
+
+#### GET /api/setting
+
+Return user setting
+
+```json
+{
+  "alias_generator": "uuid",
+  "notification": true,
+  "random_alias_default_domain": "sl.local"
+}
+```
+
+#### PATCH /api/setting
+
+Update user setting. All input fields are optional.
+
+Input:
+- alias_generator (string): uuid or word
+- notification (boolean): true or false
+- random_alias_default_domain (string): one of the domains returned by `GET /api/setting/domains`
+
+Output: same as `GET /api/setting`
+
+#### GET /api/setting/domains
+
+Return domains that user can use to create random alias
+
+```json
+[
+  [
+    true,
+    "d1.test"
+  ],
+  [
+    true,
+    "d2.test"
+  ],
+  [
+    true,
+    "sl.local"
+  ],
+  [
+    false,
+    "ab.cd"
+  ]
+]
+```
+  
 
 ### Misc endpoints
 #### POST /api/apple/process_payment

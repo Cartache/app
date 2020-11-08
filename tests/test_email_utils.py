@@ -13,6 +13,8 @@ from app.email_utils import (
     copy,
     get_spam_from_header,
     get_header_from_bounce,
+    is_valid_email,
+    add_header,
 )
 from app.extensions import db
 from app.models import User, CustomDomain
@@ -54,7 +56,6 @@ def test_can_be_used_as_personal_email(flask_client):
     # valid domains should not be affected
     assert email_can_be_used_as_mailbox("abcd@protonmail.com")
     assert email_can_be_used_as_mailbox("abcd@gmail.com")
-    assert email_can_be_used_as_mailbox("abcd@example.com")
 
 
 def test_delete_header():
@@ -286,3 +287,85 @@ DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/simple; d=simplelogin.co;
     assert (
         get_header_from_bounce(email.message_from_string(msg_str), "Not-exist") is None
     )
+
+
+def test_is_valid_email():
+    assert is_valid_email("abcd@gmail.com")
+    assert not is_valid_email("with space@gmail.com")
+    assert not is_valid_email("strange char !ç@gmail.com")
+    assert not is_valid_email("emoji👌@gmail.com")
+
+
+def test_add_header_plain_text():
+    msg = email.message_from_string(
+        """Content-Type: text/plain; charset=us-ascii
+Content-Transfer-Encoding: 7bit
+Test-Header: Test-Value
+
+coucou
+"""
+    )
+    new_msg = add_header(msg, "text header", "html header")
+    assert "text header" in new_msg.as_string()
+    assert "html header" not in new_msg.as_string()
+
+
+def test_add_header_html():
+    msg = email.message_from_string(
+        """Content-Type: text/html; charset=us-ascii
+Content-Transfer-Encoding: 7bit
+Test-Header: Test-Value
+
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=us-ascii">
+</head>
+<body style="word-wrap: break-word;" class="">
+<b class="">bold</b>
+</body>
+</html>
+"""
+    )
+    new_msg = add_header(msg, "text header", "html header")
+    assert "Test-Header: Test-Value" in new_msg.as_string()
+    assert "<table" in new_msg.as_string()
+    assert "</table>" in new_msg.as_string()
+    assert "html header" in new_msg.as_string()
+    assert "text header" not in new_msg.as_string()
+
+
+def test_add_header_multipart_alternative():
+    msg = email.message_from_string(
+        """Content-Type: multipart/alternative;
+    boundary="foo"
+Content-Transfer-Encoding: 7bit
+Test-Header: Test-Value
+
+--foo
+Content-Transfer-Encoding: 7bit
+Content-Type: text/plain;
+	charset=us-ascii
+
+bold
+
+--foo
+Content-Transfer-Encoding: 7bit
+Content-Type: text/html;
+	charset=us-ascii
+
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=us-ascii">
+</head>
+<body style="word-wrap: break-word;" class="">
+<b class="">bold</b>
+</body>
+</html>
+"""
+    )
+    new_msg = add_header(msg, "text header", "html header")
+    assert "Test-Header: Test-Value" in new_msg.as_string()
+    assert "<table" in new_msg.as_string()
+    assert "</table>" in new_msg.as_string()
+    assert "html header" in new_msg.as_string()
+    assert "text header" in new_msg.as_string()

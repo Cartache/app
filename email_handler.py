@@ -37,10 +37,11 @@ import os
 import time
 import uuid
 from email import encoders
+from email.encoders import encode_noop
 from email.message import Message
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
-from email.utils import formataddr, make_msgid
+from email.utils import formataddr, make_msgid, formatdate
 from io import BytesIO
 from smtplib import SMTP, SMTPRecipientsRefused
 from typing import List, Tuple, Optional
@@ -59,7 +60,6 @@ from app.config import (
     EMAIL_DOMAIN,
     POSTFIX_SERVER,
     URL,
-    ALIAS_DOMAINS,
     POSTFIX_SUBMISSION_TLS,
     UNSUBSCRIBER,
     LOAD_PGP_EMAIL_HANDLER,
@@ -76,14 +76,14 @@ from app.config import (
     MAX_REPLY_PHASE_SPAM_SCORE,
     ALERT_SEND_EMAIL_CYCLE,
     ALERT_MAILBOX_IS_ALIAS,
-    PREMIUM_ALIAS_DOMAINS,
+    PGP_SENDER_PRIVATE_KEY,
+    ALERT_BOUNCE_EMAIL_REPLY_PHASE,
 )
 from app.email_utils import (
     send_email,
     add_dkim_signature,
     add_or_replace_header,
     delete_header,
-    can_create_directory_for_address,
     render,
     get_orig_message_from_bounce,
     delete_all_headers_except,
@@ -99,6 +99,7 @@ from app.email_utils import (
     send_email_at_most_times,
     is_valid_alias_address_domain,
     should_add_dkim_signature,
+    add_header,
 )
 from app.extensions import db
 from app.greylisting import greylisting_needed
@@ -107,12 +108,11 @@ from app.models import (
     Alias,
     Contact,
     EmailLog,
-    CustomDomain,
     User,
     RefusedEmail,
     Mailbox,
 )
-from app.pgp_utils import PGPException
+from app.pgp_utils import PGPException, sign_data_with_pgpy, sign_data
 from app.spamassassin_utils import SpamAssassin
 from app.utils import random_string
 from init_app import load_pgp_public_keys
@@ -126,6 +126,14 @@ _MAILBOX_ID_HEADER = "X-SimpleLogin-Mailbox-ID"
 _EMAIL_LOG_ID_HEADER = "X-SimpleLogin-EmailLog-ID"
 _MESSAGE_ID = "Message-ID"
 _ENVELOPE_FROM = "X-SimpleLogin-Envelope-From"
+
+_MIME_HEADERS = [
+    "MIME-Version",
+    "Content-Type",
+    "Content-Disposition",
+    "Content-Transfer-Encoding",
+]
+_MIME_HEADERS = [h.lower() for h in _MIME_HEADERS]
 
 
 # fix the database connection leak issue
@@ -162,7 +170,7 @@ def get_or_create_contact(
         LOG.warning("From header is empty, parse mail_from %s %s", mail_from, alias)
         contact_name, contact_email = parseaddr_unicode(mail_from)
         if not contact_email:
-            LOG.exception(
+            raise Exception(
                 "Cannot parse contact from from_header:%s, mail_from:%s",
                 contact_from_header,
                 mail_from,
@@ -337,7 +345,12 @@ def replace_header_when_reply(msg: Message, alias: Alias, header: str):
 def replace_str_in_msg(msg: Message, fr: str, to: str):
     if msg.get_content_maintype() != "text":
         return msg
-    new_body = msg.get_payload(decode=True).replace(fr.encode(), to.encode())
+
+    msg_payload = msg.get_payload(decode=True)
+    if not msg_payload:
+        return msg
+
+    new_body = msg_payload.replace(fr.encode(), to.encode())
 
     # If utf-8 decoding fails, do not touch message part
     try:
@@ -383,29 +396,33 @@ def should_append_alias(msg: Message, address: str):
     return True
 
 
-_MIME_HEADERS = [
-    "MIME-Version",
-    "Content-Type",
-    "Content-Disposition",
-    "Content-Transfer-Encoding",
-]
-_MIME_HEADERS = [h.lower() for h in _MIME_HEADERS]
-
-
-def prepare_pgp_message(orig_msg: Message, pgp_fingerprint: str):
+def prepare_pgp_message(
+    orig_msg: Message, pgp_fingerprint: str, public_key: str, can_sign: bool = False
+) -> Message:
     msg = MIMEMultipart("encrypted", protocol="application/pgp-encrypted")
 
-    # copy all headers from original message except all standard MIME headers
-    for i in reversed(range(len(orig_msg._headers))):
-        header_name = orig_msg._headers[i][0].lower()
-        if header_name.lower() not in _MIME_HEADERS:
-            msg[header_name] = orig_msg._headers[i][1]
+    # clone orig message to avoid modifying it
+    clone_msg = copy(orig_msg)
 
-    # Delete unnecessary headers in orig_msg except to save space
+    # copy all headers from original message except all standard MIME headers
+    for i in reversed(range(len(clone_msg._headers))):
+        header_name = clone_msg._headers[i][0].lower()
+        if header_name.lower() not in _MIME_HEADERS:
+            msg[header_name] = clone_msg._headers[i][1]
+
+    # Delete unnecessary headers in clone_msg except _MIME_HEADERS to save space
     delete_all_headers_except(
-        orig_msg,
+        clone_msg,
         _MIME_HEADERS,
     )
+
+    if clone_msg["Content-Type"] is None:
+        LOG.d("Content-Type missing")
+        clone_msg["Content-Type"] = "text/plain"
+
+    if clone_msg["Mime-Version"] is None:
+        LOG.d("Mime-Version missing")
+        clone_msg["Mime-Version"] = "1.0"
 
     first = MIMEApplication(
         _subtype="pgp-encrypted", _encoder=encoders.encode_7or8bit, _data=""
@@ -413,18 +430,54 @@ def prepare_pgp_message(orig_msg: Message, pgp_fingerprint: str):
     first.set_payload("Version: 1")
     msg.attach(first)
 
+    if can_sign and PGP_SENDER_PRIVATE_KEY:
+        LOG.d("Sign msg")
+        clone_msg = sign_msg(clone_msg)
+
+    # use pgpy as fallback
     second = MIMEApplication(
         "octet-stream", _encoder=encoders.encode_7or8bit, name="encrypted.asc"
     )
     second.add_header("Content-Disposition", 'inline; filename="encrypted.asc"')
-    # encrypt original message
-    encrypted_data = pgp_utils.encrypt_file(
-        BytesIO(orig_msg.as_bytes()), pgp_fingerprint
-    )
-    second.set_payload(encrypted_data)
+
+    # encrypt
+    # use pgpy as fallback
+    msg_bytes = clone_msg.as_bytes()
+    try:
+        encrypted_data = pgp_utils.encrypt_file(BytesIO(msg_bytes), pgp_fingerprint)
+        second.set_payload(encrypted_data)
+    except PGPException:
+        LOG.exception("Cannot encrypt using python-gnupg, use pgpy")
+        encrypted = pgp_utils.encrypt_file_with_pgpy(msg_bytes, public_key)
+        second.set_payload(str(encrypted))
+
     msg.attach(second)
 
     return msg
+
+
+def sign_msg(msg: Message) -> Message:
+    container = MIMEMultipart(
+        "signed", protocol="application/pgp-signature", micalg="pgp-sha256"
+    )
+    container.attach(msg)
+
+    signature = MIMEApplication(
+        _subtype="pgp-signature", name="signature.asc", _data="", _encoder=encode_noop
+    )
+    signature.add_header("Content-Disposition", 'attachment; filename="signature.asc"')
+
+    try:
+        signature.set_payload(sign_data(msg.as_bytes().replace(b"\n", b"\r\n")))
+    except Exception:
+        LOG.exception("Cannot sign, try using pgpy")
+        signature.set_payload(
+            sign_data_with_pgpy(msg.as_bytes().replace(b"\n", b"\r\n"))
+        )
+
+    container.attach(signature)
+
+    return container
 
 
 def handle_email_sent_to_ourself(alias, mailbox, msg: Message, user):
@@ -477,10 +530,10 @@ def handle_forward(envelope, msg: Message, rcpt_to: str) -> List[Tuple[bool, str
             LOG.d("alias %s cannot be created on-the-fly, return 550", address)
             return [(False, "550 SL E3 Email not exist")]
 
-    if alias.user.disabled:
-        LOG.warning(
-            "User %s disabled, disable forwarding emails for %s", alias.user, alias
-        )
+    user = alias.user
+
+    if user.disabled:
+        LOG.warning("User %s disabled, disable forwarding emails for %s", user, alias)
         return [(False, "550 SL E20 Account disabled")]
 
     mail_from = envelope.mail_from
@@ -488,10 +541,37 @@ def handle_forward(envelope, msg: Message, rcpt_to: str) -> List[Tuple[bool, str
         # email send from a mailbox to alias
         if mb.email == mail_from:
             LOG.warning("cycle email sent from %s to %s", mb, alias)
-            handle_email_sent_to_ourself(alias, mb, msg, alias.user)
+            handle_email_sent_to_ourself(alias, mb, msg, user)
             return [(True, "250 Message accepted for delivery")]
 
-    contact = get_or_create_contact(msg["From"], envelope.mail_from, alias)
+    # bounce email initiated by Postfix
+    # can happen in case an email cannot be sent from an alias to a contact
+    # in this case Postfix will send a bounce report to original sender, which is the alias
+    # if mail_from == "<>":
+    #     LOG.warning("Bounce email sent to %s", alias)
+    #
+    #     handle_bounce_reply_phase(alias, msg, user)
+    #     return [(False, "550 SL E24 Email cannot be sent to contact")]
+
+    try:
+        contact = get_or_create_contact(msg["From"], envelope.mail_from, alias)
+    except:
+        # save the data for debugging
+        file_path = f"/tmp/{random_string(10)}.eml"
+        with open(file_path, "wb") as f:
+            f.write(msg.as_bytes())
+
+        LOG.exception(
+            "Cannot create contact for %s %s %s %s",
+            msg["From"],
+            envelope.mail_from,
+            alias,
+            file_path,
+        )
+        LOG.d("msg:\n%s", msg)
+        # return 421 for debug now, will use 5** in future
+        return [(True, "421 SL E25 - Invalid from address")]
+
     email_log = EmailLog.create(contact_id=contact.id, user_id=contact.user_id)
     db.session.commit()
 
@@ -503,8 +583,6 @@ def handle_forward(envelope, msg: Message, rcpt_to: str) -> List[Tuple[bool, str
         # do not return 5** to allow user to receive emails later when alias is enabled
         return [(True, "250 Message accepted for delivery")]
 
-    user = alias.user
-
     ret = []
     mailboxes = alias.mailboxes
 
@@ -513,35 +591,23 @@ def handle_forward(envelope, msg: Message, rcpt_to: str) -> List[Tuple[bool, str
         return [(False, "550 SL E16 invalid mailbox")]
 
     # no need to create a copy of message
-    if len(mailboxes) == 1:
-        mailbox = mailboxes[0]
+    for mailbox in mailboxes:
         if not mailbox.verified:
             LOG.debug("Mailbox %s unverified, do not forward", mailbox)
-            return [(False, "550 SL E18 unverified mailbox")]
+            ret.append((False, "550 SL E19 unverified mailbox"))
         else:
+            # create a copy of message for each forward
             ret.append(
                 forward_email_to_mailbox(
-                    alias, msg, email_log, contact, envelope, mailbox, user
+                    alias,
+                    copy(msg),
+                    email_log,
+                    contact,
+                    envelope,
+                    mailbox,
+                    user,
                 )
             )
-    # create a copy of message for each forward
-    else:
-        for mailbox in mailboxes:
-            if not mailbox.verified:
-                LOG.debug("Mailbox %s unverified, do not forward", mailbox)
-                ret.append((False, "550 SL E19 unverified mailbox"))
-            else:
-                ret.append(
-                    forward_email_to_mailbox(
-                        alias,
-                        copy(msg),
-                        email_log,
-                        contact,
-                        envelope,
-                        mailbox,
-                        user,
-                    )
-                )
 
     return ret
 
@@ -631,8 +697,20 @@ def forward_email_to_mailbox(
     # create PGP email if needed
     if mailbox.pgp_finger_print and user.is_premium() and not alias.disable_pgp:
         LOG.d("Encrypt message using mailbox %s", mailbox)
+        if mailbox.generic_subject:
+            LOG.d("Use a generic subject for %s", mailbox)
+            orig_subject = msg["Subject"]
+            add_or_replace_header(msg, "Subject", mailbox.generic_subject)
+            msg = add_header(
+                msg,
+                f"""Forwarded by SimpleLogin to {alias.email} with "{orig_subject}" as subject""",
+                f"""Forwarded by SimpleLogin to {alias.email} with <b>{orig_subject}</b> as subject""",
+            )
+
         try:
-            msg = prepare_pgp_message(msg, mailbox.pgp_finger_print)
+            msg = prepare_pgp_message(
+                msg, mailbox.pgp_finger_print, mailbox.pgp_public_key, can_sign=True
+            )
         except PGPException:
             LOG.exception(
                 "Cannot encrypt message %s -> %s. %s %s", contact, alias, mailbox, user
@@ -653,7 +731,11 @@ def forward_email_to_mailbox(
     add_or_replace_header(msg, _MESSAGE_ID, make_msgid(str(email_log.id), EMAIL_DOMAIN))
     add_or_replace_header(msg, _ENVELOPE_FROM, envelope.mail_from)
 
-    # change the from header so the sender comes from @SL
+    if not msg["Date"]:
+        date_header = formatdate()
+        msg["Date"] = date_header
+
+    # change the from header so the sender comes from a reverse-alias
     # so it can pass DMARC check
     # replace the email part in from: header
     contact_from_header = msg["From"]
@@ -661,7 +743,7 @@ def forward_email_to_mailbox(
     add_or_replace_header(msg, "From", new_from_header)
     LOG.d("new_from_header:%s, old header %s", new_from_header, contact_from_header)
 
-    # replace CC & To emails by reply-email for all emails that are not alias
+    # replace CC & To emails by reverse-alias for all emails that are not alias
     replace_header_when_forward(msg, alias, "Cc")
     replace_header_when_forward(msg, alias, "To")
 
@@ -831,10 +913,47 @@ def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
         handle_spam(contact, alias, msg, user, mailbox, email_log, is_reply=True)
         return False, "550 SL E15 Email detected as spam"
 
-    delete_header(msg, _IP_HEADER)
+    delete_all_headers_except(
+        msg,
+        [
+            "From",
+            "To",
+            "Cc",
+            "Subject",
+        ]
+        + _MIME_HEADERS,
+    )
 
-    delete_header(msg, "DKIM-Signature")
-    delete_header(msg, "Received")
+    # replace "ra+string@simplelogin.co" by the contact email in the email body
+    # as this is usually included when replying
+    if user.replace_reverse_alias:
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_maintype() != "text":
+                    continue
+                part = replace_str_in_msg(part, reply_email, contact.website_email)
+
+        else:
+            msg = replace_str_in_msg(msg, reply_email, contact.website_email)
+
+    # create PGP email if needed
+    if contact.pgp_finger_print and user.is_premium():
+        LOG.d("Encrypt message for contact %s", contact)
+        try:
+            msg = prepare_pgp_message(
+                msg, contact.pgp_finger_print, contact.pgp_public_key
+            )
+        except PGPException:
+            LOG.exception(
+                "Cannot encrypt message %s -> %s. %s %s", alias, contact, mailbox, user
+            )
+            # to not save the email_log
+            db.session.rollback()
+            # return 421 so the client can retry later
+            return False, "421 SL E13 Retry later"
+
+    # save the email_log to DB
+    db.session.commit()
 
     # make the email comes from alias
     from_header = alias.email
@@ -851,14 +970,6 @@ def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
 
     add_or_replace_header(msg, "From", from_header)
 
-    # some email providers like ProtonMail adds automatically the Reply-To field
-    # make sure to delete it
-    delete_header(msg, "Reply-To")
-
-    # remove sender header if present as this could reveal user real email
-    delete_header(msg, "Sender")
-    delete_header(msg, "X-Sender")
-
     replace_header_when_reply(msg, alias, "To")
     replace_header_when_reply(msg, alias, "Cc")
 
@@ -867,12 +978,12 @@ def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
         _MESSAGE_ID,
         make_msgid(str(email_log.id), get_email_domain_part(alias.email)),
     )
-    add_or_replace_header(msg, _EMAIL_LOG_ID_HEADER, str(email_log.id))
+    date_header = formatdate()
+    msg["Date"] = date_header
 
-    add_or_replace_header(msg, _DIRECTION, "Reply")
-
-    # Received-SPF is injected by postfix-policyd-spf-python can reveal user original email
-    delete_header(msg, "Received-SPF")
+    msg[_DIRECTION] = "Reply"
+    msg[_MAILBOX_ID_HEADER] = str(mailbox.id)
+    msg[_EMAIL_LOG_ID_HEADER] = str(email_log.id)
 
     LOG.d(
         "send email from %s to %s, mail_options:%s,rcpt_options:%s",
@@ -882,34 +993,8 @@ def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
         envelope.rcpt_options,
     )
 
-    # replace "ra+string@simplelogin.co" by the contact email in the email body
-    # as this is usually included when replying
-    if user.replace_reverse_alias:
-        if msg.is_multipart():
-            for part in msg.walk():
-                if part.get_content_maintype() != "text":
-                    continue
-                part = replace_str_in_msg(part, reply_email, contact.website_email)
-
-        else:
-            msg = replace_str_in_msg(msg, reply_email, contact.website_email)
-
     if should_add_dkim_signature(alias_domain):
         add_dkim_signature(msg, alias_domain)
-
-    # create PGP email if needed
-    if contact.pgp_finger_print and user.is_premium():
-        LOG.d("Encrypt message for contact %s", contact)
-        try:
-            msg = prepare_pgp_message(msg, contact.pgp_finger_print)
-        except PGPException:
-            LOG.exception(
-                "Cannot encrypt message %s -> %s. %s %s", alias, contact, mailbox, user
-            )
-            # to not save the email_log
-            db.session.rollback()
-            # return 421 so the client can retry later
-            return False, "421 SL E13 Retry later"
 
     try:
         sl_sendmail(
@@ -944,7 +1029,7 @@ def handle_reply(envelope, msg: Message, rcpt_to: str) -> (bool, str):
         )
 
     # return 250 even if error as user is already informed of the incident and can retry sending the email
-    db.session.commit()
+
     return True, "250 Message accepted for delivery"
 
 
@@ -1276,6 +1361,98 @@ def handle_bounce(contact: Contact, alias: Alias, msg: Message, user: User):
         )
 
 
+def handle_bounce_reply_phase(alias: Alias, msg: Message, user: User):
+    """
+    Handle bounce that is sent to alias
+    Happens when  an email cannot be sent from an alias to a contact
+    """
+    try:
+        email_log_id = int(get_header_from_bounce(msg, _EMAIL_LOG_ID_HEADER))
+    except Exception:
+        # save the data for debugging
+        file_path = f"/tmp/{random_string(10)}.eml"
+        with open(file_path, "wb") as f:
+            f.write(msg.as_bytes())
+
+        LOG.exception(
+            "Cannot get email-log-id from bounced report, %s %s %s",
+            alias,
+            user,
+            file_path,
+        )
+        LOG.d("Msg:\n%s", msg)
+        return
+
+    email_log = EmailLog.get(email_log_id)
+    contact = email_log.contact
+
+    # Store the bounced email
+    # generate a name for the email
+    random_name = str(uuid.uuid4())
+
+    full_report_path = f"refused-emails/full-{random_name}.eml"
+    s3.upload_email_from_bytesio(full_report_path, BytesIO(msg.as_bytes()), random_name)
+
+    orig_msg = get_orig_message_from_bounce(msg)
+    file_path = None
+    if orig_msg:
+        file_path = f"refused-emails/{random_name}.eml"
+        s3.upload_email_from_bytesio(
+            file_path, BytesIO(orig_msg.as_bytes()), random_name
+        )
+
+    refused_email = RefusedEmail.create(
+        path=file_path, full_report_path=full_report_path, user_id=user.id, commit=True
+    )
+    LOG.d("Create refused email %s", refused_email)
+
+    email_log.bounced = True
+    email_log.refused_email_id = refused_email.id
+    db.session.commit()
+
+    try:
+        mailbox_id = int(get_header_from_bounce(msg, _MAILBOX_ID_HEADER))
+    except Exception:
+        LOG.warning(
+            "cannot parse mailbox from bounce message report %s %s", alias, user
+        )
+        # fall back to the default mailbox
+        mailbox = alias.mailbox
+    else:
+        mailbox = Mailbox.get(mailbox_id)
+        email_log.bounced_mailbox_id = mailbox.id
+        db.session.commit()
+
+    refused_email_url = (
+        URL + f"/dashboard/refused_email?highlight_id=" + str(email_log.id)
+    )
+
+    LOG.d(
+        "Inform user %s about bounced email sent by %s to %s",
+        user,
+        alias,
+        contact,
+    )
+    send_email_with_rate_control(
+        user,
+        ALERT_BOUNCE_EMAIL_REPLY_PHASE,
+        mailbox.email,
+        f"Email cannot be sent to { contact.email } from your alias { alias.email }",
+        render(
+            "transactional/bounce-email-reply-phase.txt",
+            alias=alias,
+            contact=contact,
+            refused_email_url=refused_email_url,
+        ),
+        render(
+            "transactional/bounce-email-reply-phase.html",
+            alias=alias,
+            contact=contact,
+            refused_email_url=refused_email_url,
+        ),
+    )
+
+
 def handle_spam(
     contact: Contact,
     alias: Alias,
@@ -1527,12 +1704,12 @@ def handle(envelope: Envelope) -> str:
         # Reply case
         # recipient starts with "reply+" or "ra+" (ra=reverse-alias) prefix
         if rcpt_to.startswith("reply+") or rcpt_to.startswith("ra+"):
-            LOG.debug(">>> Reply phase %s(%s) -> %s", mail_from, msg["From"], rcpt_to)
+            LOG.debug("Reply phase %s(%s) -> %s", mail_from, msg["From"], rcpt_to)
             is_delivered, smtp_status = handle_reply(envelope, msg, rcpt_to)
             res.append((is_delivered, smtp_status))
         else:  # Forward case
             LOG.debug(
-                ">>> Forward phase %s(%s) -> %s",
+                "Forward phase %s(%s) -> %s",
                 mail_from,
                 msg["From"],
                 rcpt_to,

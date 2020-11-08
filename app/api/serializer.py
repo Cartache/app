@@ -64,6 +64,7 @@ def serialize_alias_info_v2(alias_info: AliasInfo) -> dict:
         ],
         "support_pgp": alias_info.alias.mailbox_support_pgp(),
         "disable_pgp": alias_info.alias.disable_pgp,
+        "latest_activity": None,
     }
     if alias_info.latest_email_log:
         email_log = alias_info.latest_email_log
@@ -222,6 +223,34 @@ def get_alias_infos_with_pagination_v3(
         .subquery()
     )
 
+    if query:
+        mailboxes_sub = (
+            db.session.query(
+                Alias.id,
+                func.count(Mailbox.id).label("nb_matched_mailboxes"),
+            )
+            .join(AliasMailbox, Alias.id == AliasMailbox.alias_id, isouter=True)
+            .join(
+                Mailbox,
+                and_(
+                    AliasMailbox.mailbox_id == Mailbox.id,
+                    Mailbox.email.ilike(f"%{query}%"),
+                ),
+                isouter=True,
+            )
+        )
+    else:
+        mailboxes_sub = (
+            db.session.query(
+                Alias.id,
+                func.count(Mailbox.id).label("nb_matched_mailboxes"),
+            )
+            .join(AliasMailbox, Alias.id == AliasMailbox.alias_id, isouter=True)
+            .join(Mailbox, AliasMailbox.mailbox_id == Mailbox.id, isouter=True)
+        )
+
+    mailboxes_sub = mailboxes_sub.group_by(Alias.id).subquery()
+
     latest_activity = case(
         [
             (Alias.created_at > EmailLog.created_at, Alias.created_at),
@@ -232,22 +261,13 @@ def get_alias_infos_with_pagination_v3(
 
     q = (
         db.session.query(
-            Alias,
-            Contact,
-            EmailLog,
-            sub.c.nb_reply,
-            sub.c.nb_blocked,
-            sub.c.nb_forward,
-            latest_activity,
-            Mailbox,
+            Alias, Contact, EmailLog, sub.c.nb_reply, sub.c.nb_blocked, sub.c.nb_forward
         )
         .join(Contact, Alias.id == Contact.alias_id, isouter=True)
         .join(EmailLog, Contact.id == EmailLog.contact_id, isouter=True)
-        .join(AliasMailbox, AliasMailbox.alias_id == Alias.id, isouter=True)
-        .filter(
-            or_(Mailbox.id == AliasMailbox.mailbox_id, Mailbox.id == Alias.mailbox_id)
-        )
+        .join(Mailbox, Alias.mailbox_id == Mailbox.id, isouter=True)
         .filter(Alias.id == sub.c.id)
+        .filter(Alias.id == mailboxes_sub.c.id)
         .filter(
             or_(
                 EmailLog.created_at == sub.c.max_created_at,
@@ -262,6 +282,7 @@ def get_alias_infos_with_pagination_v3(
                 Alias.email.ilike(f"%{query}%"),
                 Alias.note.ilike(f"%{query}%"),
                 Alias.name.ilike(f"%{query}%"),
+                mailboxes_sub.c.nb_matched_mailboxes > 0,
                 Mailbox.email.ilike(f"%{query}%"),
             )
         )
@@ -286,7 +307,7 @@ def get_alias_infos_with_pagination_v3(
     q = list(q.limit(PAGE_LIMIT).offset(page_id * PAGE_LIMIT))
 
     ret = []
-    for alias, contact, email_log, nb_reply, nb_blocked, nb_forward, _, _ in q:
+    for alias, contact, email_log, nb_reply, nb_blocked, nb_forward in q:
         ret.append(
             AliasInfo(
                 alias=alias,

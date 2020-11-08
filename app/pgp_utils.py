@@ -1,23 +1,21 @@
 import os
 from io import BytesIO
+from typing import Union
 
 import gnupg
+import pgpy
 from memory_profiler import memory_usage
+from pgpy import PGPMessage
 
-from app.config import GNUPGHOME
+from app.config import GNUPGHOME, PGP_SENDER_PRIVATE_KEY
 from app.log import LOG
 from app.models import Mailbox, Contact
-from app.utils import random_string
 
 gpg = gnupg.GPG(gnupghome=GNUPGHOME)
 gpg.encoding = "utf-8"
 
 
 class PGPException(Exception):
-    pass
-
-
-class IncorrectPassphrasePGPException(Exception):
     pass
 
 
@@ -46,9 +44,6 @@ def load_public_key_and_check(public_key: str) -> str:
         if not r.ok:
             # remove the fingerprint
             gpg.delete_keys([fingerprint])
-            if r.GPG_ERROR_CODES == {11: "incorrect passphrase"}:
-                LOG.warning("Incorrect passphrase")
-                raise IncorrectPassphrasePGPException()
             raise PGPException("Encryption fails with the key")
 
         return fingerprint
@@ -92,3 +87,28 @@ def encrypt_file(data: BytesIO, fingerprint: str) -> str:
             raise PGPException(f"Cannot encrypt, status: {r.status}")
 
     return str(r)
+
+
+def encrypt_file_with_pgpy(data: bytes, public_key: str) -> PGPMessage:
+    key = pgpy.PGPKey()
+    key.parse(public_key)
+    msg = pgpy.PGPMessage.new(data, encoding="utf-8")
+    r = key.encrypt(msg)
+
+    return r
+
+
+if PGP_SENDER_PRIVATE_KEY:
+    _SIGN_KEY_ID = gpg.import_keys(PGP_SENDER_PRIVATE_KEY).fingerprints[0]
+
+
+def sign_data(data: Union[str, bytes]) -> str:
+    signature = str(gpg.sign(data, keyid=_SIGN_KEY_ID, detach=True))
+    return signature
+
+
+def sign_data_with_pgpy(data: Union[str, bytes]) -> str:
+    key = pgpy.PGPKey()
+    key.parse(PGP_SENDER_PRIVATE_KEY)
+    signature = str(key.sign(data))
+    return signature

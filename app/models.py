@@ -83,6 +83,10 @@ class ModelMixin(object):
     def delete(cls, obj_id):
         cls.query.filter(cls.id == obj_id).delete()
 
+    @classmethod
+    def first(cls):
+        return cls.query.first()
+
     def __repr__(self):
         values = ", ".join(
             "%s=%r" % (n, getattr(self, n))
@@ -518,7 +522,14 @@ class User(db.Model, ModelMixin, UserMixin):
                 return FIRST_ALIAS_DOMAIN
 
             if sl_domain.premium_only and not self.is_premium():
-                LOG.exception("%s is not premium and cannot use %s", self, sl_domain)
+                LOG.warning(
+                    "%s is not premium and cannot use %s. Reset default random alias domain setting",
+                    self,
+                    sl_domain,
+                )
+                self.default_random_alias_domain_id = None
+                self.default_random_alias_public_domain_id = None
+                db.session.commit()
                 return FIRST_ALIAS_DOMAIN
 
             return sl_domain.domain
@@ -1278,7 +1289,7 @@ class EmailLog(db.Model, ModelMixin):
     # for ex if alias is disabled, this forwarding is blocked
     blocked = db.Column(db.Boolean, nullable=False, default=False)
 
-    # can happen when user email service refuses the forwarded email
+    # can happen when user mailbox refuses the forwarded email
     # usually because the forwarded email is too spammy
     bounced = db.Column(db.Boolean, nullable=False, default=False, server_default="0")
 
@@ -1630,6 +1641,8 @@ class Mailbox(db.Model, ModelMixin):
 
     # a mailbox can be disabled if it can't be reached
     disabled = db.Column(db.Boolean, default=False, nullable=False, server_default="0")
+
+    generic_subject = db.Column(db.String(78), nullable=True)
 
     __table_args__ = (db.UniqueConstraint("user_id", "email", name="uq_mailbox_user"),)
 

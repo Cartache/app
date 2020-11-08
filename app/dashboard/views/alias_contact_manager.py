@@ -11,7 +11,7 @@ from wtforms import StringField, validators, ValidationError
 
 from app.config import EMAIL_DOMAIN, PAGE_LIMIT
 from app.dashboard.base import dashboard_bp
-from app.email_utils import parseaddr_unicode
+from app.email_utils import parseaddr_unicode, is_valid_email
 from app.extensions import db
 from app.log import LOG
 from app.models import Alias, Contact, EmailLog
@@ -35,10 +35,8 @@ def email_validator():
             if email.find("<") + 1 < email.find(">"):
                 email_part = email[email.find("<") + 1 : email.find(">")].strip()
 
-        if re.match(r"^[A-Za-z0-9\.\+_-]+@[A-Za-z0-9\._-]+\.[a-zA-Z]*$", email_part):
-            return
-
-        raise ValidationError(message)
+        if not is_valid_email(email_part):
+            raise ValidationError(message)
 
     return _check
 
@@ -166,7 +164,7 @@ def alias_contact_manager(alias_id):
     if request.method == "POST":
         if request.form.get("form-name") == "create":
             if new_contact_form.validate():
-                contact_addr = new_contact_form.email.data.strip().lower()
+                contact_addr = new_contact_form.email.data.strip()
 
                 # generate a reply_email, make sure it is unique
                 # not use while to avoid infinite loop
@@ -180,6 +178,15 @@ def alias_contact_manager(alias_id):
                     contact_name, contact_email = parseaddr_unicode(contact_addr)
                 except Exception:
                     flash(f"{contact_addr} is invalid", "error")
+                    return redirect(
+                        url_for(
+                            "dashboard.alias_contact_manager",
+                            alias_id=alias_id,
+                        )
+                    )
+
+                if not is_valid_email(contact_email):
+                    flash(f"{contact_email} is invalid", "error")
                     return redirect(
                         url_for(
                             "dashboard.alias_contact_manager",

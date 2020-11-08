@@ -3,6 +3,7 @@ from flask import url_for
 from app.config import PAGE_LIMIT
 from app.extensions import db
 from app.models import User, ApiKey, Alias, Contact, EmailLog, Mailbox
+from tests.utils import login
 
 
 def test_get_aliases_error_without_pagination(flask_client):
@@ -73,7 +74,7 @@ def test_get_aliases_with_pagination(flask_client):
     assert len(r.json["aliases"]) == 2
 
 
-def test_get_aliases_with_pagination(flask_client):
+def test_get_aliases_query(flask_client):
     user = User.create(
         email="a@b.c", password="password", name="Test User", activated=True
     )
@@ -119,7 +120,33 @@ def test_get_aliases_v2(flask_client):
     a1 = Alias.create_new(user, "prefix1")
     db.session.commit()
 
-    # add activity for a0
+    # << Aliases have no activity >>
+    r = flask_client.get(
+        url_for("api.get_aliases_v2", page_id=0),
+        headers={"Authentication": api_key.code},
+    )
+    assert r.status_code == 200
+
+    r0 = r.json["aliases"][0]
+    assert "name" in r0
+
+    # make sure a1 is returned before a0
+    assert r0["email"].startswith("prefix1")
+    assert "id" in r0["mailbox"]
+    assert "email" in r0["mailbox"]
+
+    assert r0["mailboxes"]
+    for mailbox in r0["mailboxes"]:
+        assert "id" in mailbox
+        assert "email" in mailbox
+
+    assert "support_pgp" in r0
+    assert not r0["support_pgp"]
+
+    assert "disable_pgp" in r0
+    assert not r0["disable_pgp"]
+
+    # << Alias has some activities >>
     c0 = Contact.create(
         user_id=user.id,
         alias_id=a0.id,
@@ -148,56 +175,14 @@ def test_get_aliases_v2(flask_client):
     )
     assert r.status_code == 200
 
-    # make sure a1 is returned before a0
     r0 = r.json["aliases"][0]
-    # r0 will have the following format
-    # {
-    #     "creation_date": "2020-04-25 21:10:01+00:00",
-    #     "creation_timestamp": 1587849001,
-    #     "email": "prefix1.yeah@sl.local",
-    #     "enabled": true,
-    #     "id": 3,
-    #     "name": "Hey hey",
-    #     "latest_activity": {
-    #         "action": "forward",
-    #         "contact": {
-    #             "email": "c1@example.com",
-    #             "name": null,
-    #             "reverse_alias": "\"c1 at example.com\" <re1@SL>"
-    #         },
-    #         "timestamp": 1587849001
-    #     },
-    #     "mailbox": {
-    #         "email": "a@b.c",
-    #         "id": 1
-    #     },
-    #     "nb_block": 0,
-    #     "nb_forward": 1,
-    #     "nb_reply": 0,
-    #     "note": null
-    # }
-    assert "name" in r0
-    assert r0["email"].startswith("prefix1")
+
     assert r0["latest_activity"]["action"] == "forward"
     assert "timestamp" in r0["latest_activity"]
 
     assert r0["latest_activity"]["contact"]["email"] == "c1@example.com"
     assert "name" in r0["latest_activity"]["contact"]
     assert "reverse_alias" in r0["latest_activity"]["contact"]
-
-    assert "id" in r0["mailbox"]
-    assert "email" in r0["mailbox"]
-
-    assert r0["mailboxes"]
-    for mailbox in r0["mailboxes"]:
-        assert "id" in mailbox
-        assert "email" in mailbox
-
-    assert "support_pgp" in r0
-    assert not r0["support_pgp"]
-
-    assert "disable_pgp" in r0
-    assert not r0["disable_pgp"]
 
 
 def test_delete_alias(flask_client):
@@ -517,6 +502,32 @@ def test_create_contact_route(flask_client):
         json={"contact": "First2 Last2 <first@example.com>"},
     )
     assert r.status_code == 409
+
+
+def test_create_contact_route_empty_contact_address(flask_client):
+    login(flask_client)
+    alias = Alias.query.first()
+
+    r = flask_client.post(
+        url_for("api.create_contact_route", alias_id=alias.id),
+        json={"contact": ""},
+    )
+
+    assert r.status_code == 400
+    assert r.json["error"] == "Contact cannot be empty"
+
+
+def test_create_contact_route_invalid_contact_email(flask_client):
+    login(flask_client)
+    alias = Alias.query.first()
+
+    r = flask_client.post(
+        url_for("api.create_contact_route", alias_id=alias.id),
+        json={"contact": "with space@gmail.com"},
+    )
+
+    assert r.status_code == 400
+    assert r.json["error"] == "invalid contact email with space@gmail.com"
 
 
 def test_delete_contact(flask_client):
