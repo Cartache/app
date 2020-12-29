@@ -1,0 +1,256 @@
+#.env 
+#
+#MYDOMAIN=
+#MYHOSTNAME=
+#RELAY_HOST=
+#LETSENCRYPT_EMAIL=
+#REDIRECT_HOST=
+
+#POSTGRES_PASSWORD=
+#POSTGRES_USER=sladmin
+#POSTGRES_DB=simplelogin
+
+#HARBOR_IMAGE=metabaron/harbor-log:0.0.1
+#DB_IMAGE=postgres:12.1
+#APP_IMAGE=metabaron/app:3.2.3
+#POSTFIX_IMAGE=metabaron/sl-postfix:3.1.0-8
+#NGINX_IMAGE=metabaron/sl-nginx:0.0.6
+
+
+version: "3"
+
+services:
+
+  harbor-log:
+    image: ${HARBOR_IMAGE}
+    container_name: harbor-log
+    restart: always
+    dns_search: .
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      # mkdir /var/log/docker
+      # chown 10000:10000 /var/log/docker
+      - /var/log/docker/:/var/log/docker/:z
+      - ./sl-init/harbor-log/harbor-logrotate.conf:/etc/logrotate.d/harbor-logrotate.conf
+    networks:
+      - harbor-network
+    ports:
+      - 127.0.0.1:1514:10514
+
+  sl-db:
+    image: ${DB_IMAGE}
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+#      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ./sl/db:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    ports:
+      - "5432:5432"
+    restart:
+      always
+    networks:
+      - sl-network
+    depends_on:
+      - harbor-log
+    logging:
+      driver: "syslog"
+      options:
+        syslog-address: "tcp://127.0.0.1:1514"
+        tag: "sl-db"
+
+  sl-migration:
+    image: ${APP_IMAGE}
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ./sl:/sl
+      - ./sl/upload:/code/static/upload
+      - ./simplelogin.env:/code/.env
+      - ./dkim.key:/dkim.key
+      - ./dkim.pub.key:/dkim.pub.key
+    command: "flask db upgrade"
+    networks:
+      - sl-network
+    depends_on:
+      - sl-db
+    logging:
+      driver: "syslog"
+      options:
+        syslog-address: "tcp://127.0.0.1:1514"
+        tag: "sl-migration"
+
+  sl-init:
+    image: ${APP_IMAGE}
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ./sl:/sl
+      - ./sl/upload:/code/static/upload
+      - ./simplelogin.env:/code/.env
+      - ./dkim.key:/dkim.key
+      - ./dkim.pub.key:/dkim.pub.key
+    command: "python init_app.py"
+    networks:
+      - sl-network
+    depends_on:
+      - sl-db
+    logging:
+      driver: "syslog"
+      options:
+        syslog-address: "tcp://127.0.0.1:1514"
+        tag: "sl-init"
+
+  sl-email:
+    image: ${APP_IMAGE}
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ./sl:/sl
+      - ./sl/upload:/code/static/upload
+      - ./simplelogin.env:/code/.env
+      - ./dkim.key:/dkim.key
+      - ./dkim.pub.key:/dkim.pub.key
+    expose:
+      - "20381"
+    ports:
+      - "20381:20381"
+    command: "python email_handler.py"
+    restart:
+      always
+    networks:
+      - sl-network
+    depends_on:
+      - sl-db
+    logging:
+      driver: "syslog"
+      options:
+        syslog-address: "tcp://127.0.0.1:1514"
+        tag: "sl-email"
+
+  sl-postfix:
+    image: ${POSTFIX_IMAGE}
+    cap_add:
+      - NET_ADMIN
+    environment:
+      ALIASES_DEFAULT_DOMAIN: ${MYDOMAIN}
+      DB_HOST: sl-db
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: simplelogin
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL}
+      EMAIL_HANDLER_HOST: sl-email
+      POSTFIX_FQDN: ${MYDOMAIN}
+      RELAY_HOST: ${RELAY_HOST}
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      # chgrp -R 101 letsencrypt
+      # chmod g+rw letsencrypt
+      # find letsencrypt -type d  -exec chmod g+x {} \;
+      - ./sl/letsencrypt-postfix:/etc/letsencrypt
+      - ./sl/iptables:/etc/iptables
+    expose:
+      - "25"
+    ports:
+      - "25:25"
+    restart:
+      always
+    networks:
+      - sl-network
+      - sl-front
+    depends_on:
+      - harbor-log
+      - sl-email
+      - sl-nginx
+    logging:
+      driver: "syslog"
+      options:
+        syslog-address: "tcp://127.0.0.1:1514"
+        tag: "sl-postfix"
+
+  sl-app:
+    image: ${APP_IMAGE}
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ./sl:/sl 
+      - ./sl/upload:/code/static/upload 
+      - ./simplelogin.env:/code/.env 
+      - ./dkim.key:/dkim.key 
+      - ./dkim.pub.key:/dkim.pub.key 
+      - ./sl/words_alpha2.txt:/code/local_data/words_alpha.txt
+    expose:
+      - "7777"
+    ports:
+      - "7777:7777"
+    restart:
+      always
+    networks:
+      - sl-network
+      - sl-front
+#    depends_on:
+#      - sl-postfix
+    logging:
+      driver: "syslog"
+      options:
+        syslog-address: "tcp://127.0.0.1:1514"
+        tag: "sl-app"
+
+#Letsencrypt challenge: http://%MYHOSTNAME%/.well-known/acme-challenge/
+
+  sl-nginx:
+    image: ${NGINX_IMAGE}
+    environment:
+      MYDOMAIN: ${MYDOMAIN}
+      MYHOSTNAME: ${MYHOSTNAME}
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL}
+      REDIRECT_HOST: ${REDIRECT_HOST}
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ./sl/letsencrypt-nginx:/etc/letsencrypt
+    ports:
+      - "443:8443"
+      - "80:8000"
+    networks:
+      - sl-front
+      #- sl-network
+    restart:
+      always
+    depends_on:
+      - harbor-log
+      - sl-app
+    logging:
+      driver: "syslog"
+      options:
+        syslog-address: "tcp://127.0.0.1:1514"
+        tag: "sl-nginx"
+
+networks:
+  sl-front:
+    external: false
+
+  harbor-network:
+    external: false
+
+  sl-network:
+    external: false
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 240.0.1.0/24
+##          gateway: 240.0.0.1
