@@ -1253,7 +1253,8 @@ class Contact(db.Model, ModelMixin):
             elif user.sender_format == SenderFormatEnum.A.value:
                 formatted_email = self.website_email.replace("@", "(a)").strip()
             elif user.sender_format == SenderFormatEnum.FULL.value:
-                formatted_email = self.website_email.strip()
+                formatted_email = self.website_email.replace(".", "(dot)").strip()
+#                formatted_email = self.website_email.strip()
 
             # Prefix name to formatted email if available
             new_name = (
